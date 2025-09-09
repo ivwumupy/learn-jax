@@ -166,12 +166,6 @@ class MicroLM(nnx.Module):
     def __init__(
         self,
         config: MicroLMConfig,
-        # vocab_size: int,
-        # embed_dim: int,
-        # qk_dim: int,
-        # hidden_dim: int,
-        # block_size: int,
-        # layer_count: int,
         *,
         rngs: nnx.Rngs,
     ):
