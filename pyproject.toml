@@ -9,6 +9,7 @@ dependencies = [
     "jax[cuda12]>=0.7.1",
     "optax>=0.2.5",
     "regex>=2025.9.1",
+    "scikit-learn>=1.7.2",
 ]
 
 [dependency-groups]
