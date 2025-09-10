@@ -2,6 +2,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import enum
 import math
+from typing import Optional
 
 from flax import nnx
 import jax
@@ -81,7 +82,11 @@ class LayerNorm(nnx.Module):
 
 
 def generic_dot_product_attention(
-    q: jax.Array, k: jax.Array, v: jax.Array, *, use_scale: bool = True
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    mask: Optional[jax.Array] = None,
+    use_scale: bool = True,
 ) -> jax.Array:
     """
     Compute the (scaled) dot-product attention.
@@ -93,15 +98,20 @@ def generic_dot_product_attention(
         k: shape (...batch, kv_count, qk_dim)
         v: shape (...batch, kv_count, v_dim)
 
+        mask: shape (...batch, query_count, kv_count)
+
     Return:
         shape (...batch, query_count, v_dim)
     """
     assert q.shape[-1] == k.shape[-1]
+    assert k.shape[-2] == v.shape[-2]
     qk = jnp.einsum("...ij,...kj->...ik", q, k)
     if use_scale:
         dk = k.shape[-1]
-        # TODO:
         qk *= lax.rsqrt(float(dk))
+    if mask is not None:
+        neg_inf = jnp.finfo(jnp.float32).min
+        qk = jnp.where(mask, qk, neg_inf)
     s = jnn.softmax(qk, axis=-1)
     return jnp.einsum("...ij,...jk->...ik", s, v)
 
@@ -127,11 +137,18 @@ class DotProductAttention(nnx.Module):
         self.W_k = nnx.Param(rngs.params.uniform((input_k_dim, qk_dim)))
         self.W_v = nnx.Param(rngs.params.uniform((input_v_dim, output_dim)))
 
-    def __call__(self, q: jax.Array, k: jax.Array, v: jax.Array):
+    def __call__(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        *,
+        mask: Optional[jax.Array] = None,
+    ):
         q1 = q @ self.W_q
         k1 = k @ self.W_k
         v1 = v @ self.W_v
-        return generic_dot_product_attention(q1, k1, v1, use_scale=self.use_scale)
+        return generic_dot_product_attention(q1, k1, v1, mask, use_scale=self.use_scale)
 
 
 class FeedForward(nnx.Module):
@@ -176,13 +193,6 @@ class StaticPositionEncoding(nnx.Module):
     ):
         self.A = initializer(block_size, embed_dim)
 
-        # position = jnp.arange(0, block_size)
-        # frequency = jnp.arange(1, embed_dim // 2 + 1) * 2 * math.pi
-        # M = position.reshape((block_size,1)) * frequency / embed_dim
-        # even = jnp.sin(M)
-        # odd = jnp.cos(M)
-        # self.A = jnp.stack([even,odd],axis=2).reshape((block_size,embed_dim))
-
     def __call__(self, pos: jax.Array):
         return jnp.take(self.A, pos, axis=0)
 
@@ -207,6 +217,9 @@ class MicroLMConfig:
 
 
 class MicroLM(nnx.Module):
+    attentions: list[DotProductAttention]
+    feed_forwards: list[FeedForward]
+
     def __init__(
         self,
         config: MicroLMConfig,
@@ -229,12 +242,13 @@ class MicroLM(nnx.Module):
                 )
             case _:
                 raise Exception("unimplmented")
+
         self.embed_normalization = LayerNorm(config.embed_dim, rngs=rngs)
 
         self.attentions = []
         self.feed_forwards = []
 
-        for i in range(config.layer_count):
+        for _ in range(config.layer_count):
             self.attentions.append(
                 DotProductAttention(
                     config.embed_dim,
@@ -252,13 +266,16 @@ class MicroLM(nnx.Module):
             )
         self.lm_head = Linear(config.embed_dim, config.vocab_size, rngs=rngs)
 
-    def __call__(self, input: jax.Array):
+    def __call__(self, input: jax.Array, padding_mask: jax.Array):
         """
         Args:
             input: shape (...batch, block_size). an array of token ids
         """
         seq_len = input.shape[-1]
-        assert seq_len <= self.config.block_size
+        assert seq_len == self.config.block_size
+        assert seq_len == padding_mask.shape[-1]
+
+        mask = padding_mask[:, jnp.newaxis] & padding_mask[..., jnp.newaxis]
 
         x = self.token_embed(input)
 
@@ -267,7 +284,7 @@ class MicroLM(nnx.Module):
 
         for i in range(self.config.layer_count):
             x_norm = self.embed_normalization(x)
-            x += self.attentions[i](x_norm, x_norm, x_norm)
+            x += self.attentions[i](x_norm, x_norm, x_norm, mask=mask)
             x_norm = self.embed_normalization(x)
             x += self.feed_forwards[i](x_norm)
 
